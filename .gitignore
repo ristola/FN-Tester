@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+venv/
+venv310/
+*.bak_*
+.DS_Store
+.claude/
