@@ -51,6 +51,8 @@ enum SM_MessageType : uint8_t
     // Commands
     SM_SET_VALUE = 0x20, // SM_ValuePayload - set a writable value
     SM_COMMAND = 0x21,   // SM_CommandPayload - trigger a named action
+    SM_RENAME = 0x22,    // unicast: SM_RenamePayload - "call yourself this from now on" (persisted, not a one-shot label)
+    SM_FN_MAIN_STATUS = 0x23, // broadcast: SM_FnMainStatusPayload - the FN pod's live/simulated FN-MAIN decode snapshot
 
     // Responses
     SM_ACK = 0x30,   // SM_AckPayload - acknowledges a message by sequence #
@@ -295,6 +297,50 @@ struct SM_CommandPayload
 {
     char commandName[16];
     int32_t argument; // meaning is command-specific; 0 if unused
+};
+#pragma pack(pop)
+
+// A persisted rename, not a one-shot display label - the receiver should
+// save this (surviving reboot) and use it in every future
+// SM_DeviceIdentity it sends (SM_ANNOUNCE/SM_HEARTBEAT/etc.), the same way
+// this project's own devices persist their own friendly name locally
+// (e.g. the CYD's g_config.espnow_friendly_name). Not folded into
+// SM_CommandPayload since that struct's commandName[16] has no room for a
+// full 24-char name alongside it.
+#pragma pack(push, 1)
+struct SM_RenamePayload
+{
+    char newName[24]; // matches SM_DeviceIdentity.friendlyName's size
+};
+#pragma pack(pop)
+
+// FnMainProfileMatch, mirrored from the pod's fn_pcb085_profile.h - kept as
+// a plain wire-format enum here (not #included) since the CYD has no
+// reason to depend on that pod-side header. PCB-110 has zero confirmed
+// address mappings anywhere in this project - kUnrecognized means "doesn't
+// match PCB-085," never "confirmed PCB-110."
+enum FnMainProfileMatch : uint8_t
+{
+    FN_MAIN_PROFILE_NONE = 0,
+    FN_MAIN_PROFILE_PCB085 = 1,
+    FN_MAIN_PROFILE_UNRECOGNIZED = 2,
+};
+
+// The FN pod's live/simulated FN-MAIN decode snapshot, broadcast whenever
+// it changes (see main.cpp's fn_word_decoder.h-driven decode loop). There
+// is no real protected FN-MAIN receive interface yet (see
+// FN_OUTPUT_Tester_Handoff/docs/TESTER_ARCHITECTURE.md's "Interface
+// Safety") - today this only ever reflects a simulated capture replay
+// (simulating != false), never a live bus.
+#pragma pack(push, 1)
+struct SM_FnMainStatusPayload
+{
+    uint8_t simulating;      // bool - pod is currently replaying a simulated capture
+    uint8_t profileMatch;    // FnMainProfileMatch
+    uint8_t outputs[16];     // 0/1 per output - only indices with a confirmed address (currently 0-7) are ever set
+    uint8_t analogCode;      // 0-15 - only meaningful once address 10110 has been seen this session
+    uint8_t lastAddressBits; // most recently decoded 5-bit address, packed MSB-first (bit4=A1..bit0=A5) - for raw diagnostics, per this project's "never hide the raw address" rule
+    char captureLabel[24];   // which embedded capture is currently playing (see the pod's fn_main_sim_captures.h) - button press cycles to the next one
 };
 #pragma pack(pop)
 

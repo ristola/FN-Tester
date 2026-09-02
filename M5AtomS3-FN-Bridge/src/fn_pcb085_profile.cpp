@@ -8,6 +8,18 @@ namespace
     constexpr bool kAddr10010[5] = {true, false, false, true, false};
     constexpr bool kAddr10110[5] = {true, false, true, true, false};
     constexpr bool kAddr10100[5] = {true, false, true, false, false};
+    // UNKNOWN candidate banks (possibly Outputs 9-12/13-16 - see
+    // docs/PCB085_ANALYSIS.md section 15) - recognized, not decoded.
+    constexpr bool kAddr10000[5] = {true, false, false, false, false};
+    constexpr bool kAddr10011[5] = {true, false, false, true, true};
+
+    bool address_matches(const bool addressBits[5], const bool pattern[5])
+    {
+        for (int i = 0; i < 5; i++)
+            if (addressBits[i] != pattern[i])
+                return false;
+        return true;
+    }
 
     uint8_t analog_code_from_percent(uint8_t percent)
     {
@@ -73,4 +85,45 @@ size_t fn_pcb085_profile_build_cycle(const bool outputs[kFnPcb085MaxOutputs], ui
     }
 
     return total;
+}
+
+FnMainProfileMatch fn_pcb085_profile_apply_decoded_word(const FnDecodedWord &word,
+                                                          bool outputs[kFnPcb085MaxOutputs], uint8_t *analogCode)
+{
+    if (address_matches(word.addressBits, kAddr10001))
+    {
+        outputs[0] = word.dataBits[0];
+        outputs[1] = word.dataBits[1];
+        outputs[2] = word.dataBits[2];
+        outputs[3] = word.dataBits[3];
+        return FN_MAIN_PROFILE_PCB085;
+    }
+    if (address_matches(word.addressBits, kAddr10010))
+    {
+        outputs[4] = word.dataBits[0];
+        outputs[5] = word.dataBits[1];
+        outputs[6] = word.dataBits[2];
+        outputs[7] = word.dataBits[3];
+        return FN_MAIN_PROFILE_PCB085;
+    }
+    if (address_matches(word.addressBits, kAddr10110))
+    {
+        // LSB-first, matching fn_pcb085_profile_build_cycle()'s encode
+        // direction: D1=bit0, D2=bit1, D3=bit2, D4=bit3.
+        *analogCode = static_cast<uint8_t>((word.dataBits[0] ? 0x1 : 0) | (word.dataBits[1] ? 0x2 : 0) |
+                                            (word.dataBits[2] ? 0x4 : 0) | (word.dataBits[3] ? 0x8 : 0));
+        return FN_MAIN_PROFILE_PCB085;
+    }
+    if (address_matches(word.addressBits, kAddr10100) || address_matches(word.addressBits, kAddr10000) ||
+        address_matches(word.addressBits, kAddr10011))
+    {
+        // Known PCB-085 addresses with no further confirmed state to
+        // surface yet (10100 experimental companion, 10000/10011 UNKNOWN
+        // candidate banks) - recognized, but deliberately not decoded
+        // further, per docs/PCB085_ANALYSIS.md section 15's "do not assign
+        // them until supported by a capture" rule.
+        return FN_MAIN_PROFILE_PCB085;
+    }
+
+    return FN_MAIN_PROFILE_UNRECOGNIZED;
 }

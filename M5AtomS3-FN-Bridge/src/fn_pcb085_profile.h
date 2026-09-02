@@ -5,7 +5,9 @@
 
 #include "esp32-hal-rmt.h"
 
+#include "espnow_protocol.h"
 #include "fn_symbol_codec.h"
+#include "fn_word_decoder.h"
 
 // PCB-085 board profile - the ONLY place that knows what a PCB-085
 // address/data word means, per FN_OUTPUT_Tester_Handoff/CLAUDE.md's
@@ -47,3 +49,16 @@ constexpr size_t kFnPcb085MaxWords = kFnPcb085AddressCount * kFnWordsPerAddressB
 // written, or 0 on overflow.
 size_t fn_pcb085_profile_build_cycle(const bool outputs[kFnPcb085MaxOutputs], uint8_t analogPercent,
                                       rmt_data_t *out, size_t outCapacity);
+
+// Decode-direction inverse of fn_pcb085_profile_build_cycle(): given one
+// word decoded by fn_word_decoder.h (address+data bits, not yet
+// interpreted), updates outputs[]/*analogCode in place for the two
+// confirmed digital banks (10001->Outputs 1-4, 10010->Outputs 5-8) and the
+// confirmed analog bank (10110, LSB-first - matching the encode direction
+// above). 10100 (analog companion, still experimental) and the UNKNOWN
+// candidate banks 10000/10011 are recognized as a known PCB-085 address
+// (returns FN_MAIN_PROFILE_PCB085) without exposing any further state -
+// there's no confirmed meaning yet to surface for them. Returns
+// FN_MAIN_PROFILE_UNRECOGNIZED for any other 5-bit address.
+FnMainProfileMatch fn_pcb085_profile_apply_decoded_word(const FnDecodedWord &word,
+                                                          bool outputs[kFnPcb085MaxOutputs], uint8_t *analogCode);

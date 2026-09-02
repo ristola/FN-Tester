@@ -65,6 +65,14 @@ void espnow_note_device_seen(uint32_t deviceID, const char *friendlyName, uint8_
 int espnow_known_device_count();
 const SM_KnownDevice *espnow_known_device(int index);
 
+// True if `deviceID` has been seen (SM_ANNOUNCE/SM_HEARTBEAT) within the
+// last `maxAgeMs` - a generic mesh-reachability check, for screens that
+// need to know whether a specific paired device's link is still alive
+// (e.g. ui_fn_main.cpp auto-exiting Simulate mode if the pod goes quiet),
+// not just whether it was ever seen at all. False if the device has never
+// been seen this boot.
+bool espnow_device_seen_within(uint32_t deviceID, uint32_t maxAgeMs);
+
 // Human-readable label for an SM_DeviceType value, for UI display.
 const char *espnow_device_type_name(uint8_t deviceType);
 
@@ -155,6 +163,11 @@ const SM_PairedBridge *espnow_paired_bridge(int index);
 // keep trying to use the network for as long as it holds credentials.
 void espnow_forget_paired_bridge(int index);
 
+// Index of the first paired bridge whose deviceType is an FN 2-wire pod
+// (SM_DEVICE_FN_2WIRE_POD), or -1 if none is paired yet - shared by the FN
+// Output and FN Main screens, which both only ever talk to one such pod.
+int espnow_find_fn_pod_bridge_index();
+
 // The most recent SM_PING received (e.g. from a pod's button press), for
 // UI display - the ESP NOW page shows "Ping received from <name>". name
 // is looked up from the known-devices table by deviceID at the time the
@@ -187,6 +200,27 @@ struct SM_FnTxStatus
 
 // nullptr if no FN pod has reported a TX-mode status yet this boot.
 const SM_FnTxStatus *espnow_last_fn_tx_status();
+
+// Most recent FN Main decode snapshot (SM_FN_MAIN_STATUS, broadcast by an
+// FN pod whenever its decoded state changes - see espnow_protocol.h's
+// SM_FnMainStatusPayload). Only recorded from SM_DEVICE_FN_2WIRE_POD, same
+// gating as espnow_last_fn_tx_status(). There is no real FN-MAIN receive
+// interface yet - simulating is only ever true from a pod replaying a
+// canned capture (see M5AtomS3-FN-Bridge/src/main.cpp), never a live bus.
+struct SM_FnMainStatus
+{
+    uint32_t deviceID;
+    bool simulating;
+    uint8_t profileMatch;    // FnMainProfileMatch
+    bool outputs[16];
+    uint8_t analogCode;      // 0-15
+    uint8_t lastAddressBits; // packed MSB-first, bit4=A1..bit0=A5
+    char captureLabel[24];   // which embedded capture is currently playing
+    uint32_t receivedMs;     // millis() timestamp
+};
+
+// nullptr if no FN pod has reported an FN Main status yet this boot.
+const SM_FnMainStatus *espnow_last_fn_main_status();
 
 // Human-readable label for an SM_MessageType value, for the Monitor page's
 // traffic log below (e.g. "PING", "HEARTBEAT").

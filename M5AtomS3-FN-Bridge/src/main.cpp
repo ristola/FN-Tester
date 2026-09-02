@@ -43,9 +43,11 @@
 
 #include "espnow_protocol.h"
 #include "fn_bus_tx.h"
+#include "fn_main_sim_captures.h"
 #include "fn_pcb085_profile.h"
 #include "fn_reference_frame.h"
 #include "fn_symbol_codec.h"
+#include "fn_word_decoder.h"
 
 namespace
 {
@@ -178,6 +180,42 @@ namespace
     // across rebuilds rather than allocated per-call (this pod never uses
     // dynamic allocation for anything timing-relevant).
     rmt_data_t s_fn_pcb085_buffer[kFnPcb085MaxWords];
+
+    // FN Main "Simulate" mode: replays one of fn_main_sim_captures.h's real
+    // captures edge-by-edge through fn_word_decoder.h's real-time decoder,
+    // so the decode+profile pipeline can be proven and demonstrated with no
+    // FN-MAIN receive hardware existing yet (see
+    // FN_OUTPUT_Tester_Handoff/docs/TESTER_ARCHITECTURE.md's "Interface
+    // Safety"). SIM_ENABLE auto-starts and free-runs through all captures,
+    // kSimCaptureDurationMs each, looping back to the first once the last
+    // one finishes - the front button (loop()) can still jump to the next
+    // one early, which also resets that capture's own 5s clock. SIM_DISABLE
+    // (or the link going quiet - see cyd_link_lost()) is the only way to
+    // actually stop. Plain variable writes throughout - like
+    // s_fn_output_state above, nothing here touches RMT, so on_command()
+    // (the ESP-NOW receive-callback task) can set these directly; no
+    // FN_TX_START-style deferral to loop() needed.
+    bool s_sim_enabled = false;
+    size_t s_sim_capture_index = 0;
+    size_t s_sim_edge_index = 0;
+    uint32_t s_sim_next_edge_due_us = 0; // micros()-paced, not blocking delay()s - see service_fn_main_sim()
+    uint32_t s_sim_capture_started_ms = 0;
+    // Real-hardware timing measurement (real capture playback, since
+    // service_fn_main_sim() paces edges at their actual captured duration):
+    // FN-MAIN cycles through all 6 addresses roughly every ~8.7s, and
+    // Outputs 1-4 only live on address 10001, the *last* one reached in a
+    // cycle - a shorter duration than this can cut off before that address
+    // is ever decoded once. 15s leaves ~6s of settled, fully-decoded
+    // display after the first full cycle completes.
+    constexpr uint32_t kSimCaptureDurationMs = 15000;
+    FnWordDecoder s_fn_word_decoder;
+
+    // Most recently decoded state, mirrored out via SM_FN_MAIN_STATUS
+    // whenever a new word is decoded - see broadcast_fn_main_status().
+    FnMainProfileMatch s_fn_main_profile_match = FN_MAIN_PROFILE_NONE;
+    bool s_fn_main_outputs[kMaxFnOutputs] = {false};
+    uint8_t s_fn_main_analog_code = 0;
+    uint8_t s_fn_main_last_address_bits = 0; // packed MSB-first, bit4=A1..bit0=A5
 
     // TEMPORARY DIAGNOSTIC: a plain digitalWrite() 1Hz square wave on GPIO2,
     // bypassing RMT/fn_bus_tx entirely. Every capture of the RMT-driven
@@ -399,6 +437,120 @@ namespace
     {
         fn_bus_tx_stop();
         set_fn_tx_mode(FN_TX_MODE_OFF);
+    }
+
+    // Broadcasts the current FN Main decode snapshot unconditionally
+    // (unlike set_fn_tx_mode()'s change-only broadcast) - called right
+    // after every successfully decoded word, which is itself already
+    // naturally rate-limited by real FN protocol timing (tens of ms
+    // apart), so there's no flooding risk from not de-duplicating here.
+    void broadcast_fn_main_status()
+    {
+        SM_FnMainStatusPayload status{};
+        status.simulating = s_sim_enabled ? 1 : 0;
+        status.profileMatch = s_fn_main_profile_match;
+        for (int i = 0; i < kMaxFnOutputs; i++)
+            status.outputs[i] = s_fn_main_outputs[i] ? 1 : 0;
+        status.analogCode = s_fn_main_analog_code;
+        status.lastAddressBits = s_fn_main_last_address_bits;
+        strncpy(status.captureLabel, kFnMainSimCaptures[s_sim_capture_index].label, sizeof(status.captureLabel) - 1);
+        status.captureLabel[sizeof(status.captureLabel) - 1] = '\0';
+        send_broadcast(SM_FN_MAIN_STATUS, &status, sizeof(status));
+    }
+
+    // True once this pod has a saved CYD MAC (i.e. has ever completed
+    // provisioning under this firmware) and hasn't heard anything from it
+    // in over kCydLinkLostTimeoutMs - shared by the LED's red-blink cue
+    // (update_led(), further down) and service_fn_main_sim()'s auto-exit,
+    // so both agree on exactly what "the link is broken" means.
+    bool cyd_link_lost()
+    {
+        return s_have_cyd_mac && millis() - s_last_cyd_seen_ms >= kCydLinkLostTimeoutMs;
+    }
+
+    // (Re)starts playback from the beginning of kFnMainSimCaptures[index]
+    // (wrapping around) - resets the decoder so stale in-progress word/pair
+    // state from whatever was playing before can't bleed into the new
+    // capture, and clears the last-decoded snapshot so the CYD doesn't keep
+    // showing the previous capture's outputs while this one's first word is
+    // still in flight.
+    void fn_main_sim_start_capture(size_t index)
+    {
+        s_sim_capture_index = index % kFnMainSimCaptureCount;
+        s_sim_edge_index = 0;
+        s_sim_next_edge_due_us = micros();
+        s_sim_capture_started_ms = millis();
+        s_fn_word_decoder.reset();
+
+        s_fn_main_profile_match = FN_MAIN_PROFILE_NONE;
+        for (int i = 0; i < kMaxFnOutputs; i++)
+            s_fn_main_outputs[i] = false;
+        s_fn_main_analog_code = 0;
+        s_fn_main_last_address_bits = 0;
+
+        Serial.printf("FN Main sim: now playing \"%s\" (%u/%u)\n", kFnMainSimCaptures[s_sim_capture_index].label,
+                      static_cast<unsigned>(s_sim_capture_index + 1), static_cast<unsigned>(kFnMainSimCaptureCount));
+        broadcast_fn_main_status();
+    }
+
+    void fn_main_sim_next_capture()
+    {
+        fn_main_sim_start_capture(s_sim_capture_index + 1);
+    }
+
+    // Called every loop() iteration; no-op unless simulation is armed. Feeds
+    // the current capture's edges into the decoder one at a time, paced
+    // against each edge's own real captured duration via micros() (not a
+    // blocking delay()), so it doesn't stall ESP-NOW/fn_bus_tx - same
+    // non-blocking requirement as everything else in loop(). Each capture
+    // free-runs (looping its own edges continuously, like real continuous
+    // FN-MAIN traffic) for kSimCaptureDurationMs before auto-advancing to
+    // the next one, wrapping back to the first after the last - a button
+    // press/SIM command can still jump ahead early. If the paired CYD goes
+    // quiet (cyd_link_lost()), simulation auto-exits here rather than
+    // running unattended indefinitely - the CYD side independently exits
+    // its own UI state the same way (ui_fn_main.cpp), so both ends recover
+    // without depending on a message getting through a broken link.
+    void service_fn_main_sim()
+    {
+        if (!s_sim_enabled)
+            return;
+
+        if (cyd_link_lost())
+        {
+            Serial.println("FN Main sim: CYD link lost - auto-disabling simulation");
+            s_sim_enabled = false;
+            return;
+        }
+
+        if (millis() - s_sim_capture_started_ms >= kSimCaptureDurationMs)
+        {
+            fn_main_sim_next_capture();
+            return;
+        }
+
+        if (static_cast<int32_t>(micros() - s_sim_next_edge_due_us) < 0)
+            return;
+
+        const FnSimCapture &capture = kFnMainSimCaptures[s_sim_capture_index];
+        const FnSimEdge &edge = capture.edges[s_sim_edge_index];
+
+        FnDecodedWord word;
+        if (s_fn_word_decoder.feed(edge.durationUs, &word))
+        {
+            s_fn_main_profile_match = fn_pcb085_profile_apply_decoded_word(word, s_fn_main_outputs, &s_fn_main_analog_code);
+            uint8_t addrBits = 0;
+            for (int i = 0; i < 5; i++)
+                if (word.addressBits[i])
+                    addrBits |= static_cast<uint8_t>(1u << (4 - i));
+            s_fn_main_last_address_bits = addrBits;
+            broadcast_fn_main_status();
+        }
+
+        s_sim_next_edge_due_us += edge.durationUs;
+        s_sim_edge_index++;
+        if (s_sim_edge_index >= capture.length)
+            s_sim_edge_index = 0;
     }
 
     void send_discover()
@@ -714,8 +866,9 @@ namespace
     // "SET_MODEL"/"SET_OUTPUT"/"SET_ANALOG"/"ALL_OUTPUTS_OFF" (the FN
     // Output screen's board-profile/output-bitmap/analog state - see
     // s_fn_output_model's comment for how this is folded into the
-    // transmitted waveform via start_fn_tx_for_current_state()).
-    // Acknowledges receipt with SM_ACK either way,
+    // transmitted waveform via start_fn_tx_for_current_state()),
+    // "SIM_ENABLE"/"SIM_DISABLE" (the FN Main screen's Simulate toggle -
+    // see s_sim_enabled's comment). Acknowledges receipt with SM_ACK either way,
     // including for a name this firmware doesn't recognize, so the sender
     // at least knows the packet arrived.
     void on_command(const uint8_t *mac, uint16_t sequence, const uint8_t *payload, int payloadLen)
@@ -818,6 +971,18 @@ namespace
                 s_fn_output_state[i] = false;
             s_fn_rebuild_requested = true;
             Serial.println("FN outputs -> all OFF");
+        }
+        else if (strcmp(cmd.commandName, "SIM_ENABLE") == 0)
+        {
+            s_sim_enabled = true;
+            fn_main_sim_start_capture(0); // auto-starts the first capture immediately
+            Serial.println("FN Main simulation ENABLED - button now cycles captures instead of pinging");
+        }
+        else if (strcmp(cmd.commandName, "SIM_DISABLE") == 0)
+        {
+            s_sim_enabled = false;
+            broadcast_fn_main_status(); // immediately reflect "not simulating" rather than waiting on the CYD's staleness timeout
+            Serial.println("FN Main simulation DISABLED - button back to normal ping");
         }
         else
         {
@@ -938,7 +1103,7 @@ namespace
             label = s_holding ? "red/green blink (holding, awaiting decision)"
                                : "red/green blink (sweeping, needs pairing)";
         }
-        else if (s_have_cyd_mac && millis() - s_last_cyd_seen_ms >= kCydLinkLostTimeoutMs)
+        else if (cyd_link_lost())
         {
             color = s_led.Color(150, 0, 0); // red: joined the mesh, but the paired CYD has gone quiet
             label = "red (mesh joined, CYD link lost)";
@@ -1168,8 +1333,20 @@ void loop()
         }
         else if (cmd == "uarttest")
             uart_test_start();
+        else if (cmd == "simenable")
+        {
+            s_sim_enabled = true;
+            fn_main_sim_start_capture(0);
+        }
+        else if (cmd == "simdisable")
+        {
+            s_sim_enabled = false;
+            broadcast_fn_main_status();
+        }
+        else if (cmd == "simnext")
+            fn_main_sim_next_capture();
         else if (cmd.length() > 0)
-            Serial.printf("Unknown command \"%s\" - try \"tx\", \"square\", \"uarttest\", or \"stop\"\n", cmd.c_str());
+            Serial.printf("Unknown command \"%s\" - try \"tx\", \"square\", \"uarttest\", \"simenable\", \"simdisable\", \"simnext\", or \"stop\"\n", cmd.c_str());
     }
 
     if (s_square_test_active && now - s_square_test_last_toggle_ms >= kSquareTestHalfPeriodMs)
@@ -1225,6 +1402,8 @@ void loop()
             start_fn_tx_for_current_state();
     }
 
+    service_fn_main_sim();
+
     // Front button: hold for kFactoryResetHoldMs (5s) *any time*, not just
     // at boot, to forget the saved channel and restart into pairing mode -
     // a physical "restore to defaults" without reflashing or
@@ -1259,8 +1438,20 @@ void loop()
         uint32_t held = now - s_button_press_start_ms;
         if (held >= kMinClickMs && s_provisioned)
         {
-            Serial.println("Button pressed - sending SM_PING to test connectivity");
-            send_ping();
+            // While a simulation is armed, the button's normal ping role
+            // is repurposed to cycle through captures instead (see
+            // s_sim_enabled's comment) - SIM_DISABLE is the only way back
+            // to normal ping behavior.
+            if (s_sim_enabled)
+            {
+                Serial.println("Button pressed - advancing FN Main simulation to the next capture");
+                fn_main_sim_next_capture();
+            }
+            else
+            {
+                Serial.println("Button pressed - sending SM_PING to test connectivity");
+                send_ping();
+            }
         }
     }
     s_button_was_down = button_down;

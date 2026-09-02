@@ -55,6 +55,9 @@ namespace
     bool s_have_last_fn_tx_status = false;
     SM_FnTxStatus s_last_fn_tx_status = {};
 
+    bool s_have_last_fn_main_status = false;
+    SM_FnMainStatus s_last_fn_main_status = {};
+
     SM_TrafficLogEntry s_traffic_log[kMaxTrafficLogEntries];
     int s_traffic_log_count = 0; // entries filled so far, caps at kMaxTrafficLogEntries
     int s_traffic_log_next = 0;  // ring buffer write cursor
@@ -500,6 +503,29 @@ namespace
             s_last_fn_tx_status.receivedMs = millis();
             break;
         }
+        case SM_FN_MAIN_STATUS:
+        {
+            uint8_t deviceType = 0;
+            if (payloadLen < static_cast<int>(sizeof(SM_FnMainStatusPayload)) ||
+                !find_known_device_type(header.sourceID, &deviceType) ||
+                deviceType != SM_DEVICE_FN_2WIRE_POD)
+                break;
+
+            SM_FnMainStatusPayload status;
+            memcpy(&status, payload, sizeof(status));
+            s_have_last_fn_main_status = true;
+            s_last_fn_main_status.deviceID = header.sourceID;
+            s_last_fn_main_status.simulating = status.simulating != 0;
+            s_last_fn_main_status.profileMatch = status.profileMatch;
+            for (int i = 0; i < 16; i++)
+                s_last_fn_main_status.outputs[i] = status.outputs[i] != 0;
+            s_last_fn_main_status.analogCode = status.analogCode;
+            s_last_fn_main_status.lastAddressBits = status.lastAddressBits;
+            strncpy(s_last_fn_main_status.captureLabel, status.captureLabel, sizeof(s_last_fn_main_status.captureLabel) - 1);
+            s_last_fn_main_status.captureLabel[sizeof(s_last_fn_main_status.captureLabel) - 1] = '\0';
+            s_last_fn_main_status.receivedMs = millis();
+            break;
+        }
         case SM_PING:
         {
             if (payloadLen < static_cast<int>(sizeof(SM_PingPayload)))
@@ -684,6 +710,14 @@ const SM_KnownDevice *espnow_known_device(int index)
     return &s_known_devices[index];
 }
 
+bool espnow_device_seen_within(uint32_t deviceID, uint32_t maxAgeMs)
+{
+    for (int i = 0; i < s_known_device_count; i++)
+        if (s_known_devices[i].deviceID == deviceID)
+            return millis() - s_known_devices[i].lastSeenMs < maxAgeMs;
+    return false;
+}
+
 bool espnow_has_incoming_pair_request()
 {
     if (s_have_pending_request && millis() - s_pending_request_ms >= kPendingRequestTimeoutMs)
@@ -792,6 +826,14 @@ void espnow_forget_paired_bridge(int index)
         s_have_pending_request = false;
 }
 
+int espnow_find_fn_pod_bridge_index()
+{
+    for (int i = 0; i < s_paired_bridge_count; i++)
+        if (s_paired_bridges[i].deviceType == SM_DEVICE_FN_2WIRE_POD)
+            return i;
+    return -1;
+}
+
 SM_PairOutcome espnow_pair_outcome()
 {
     if (s_pair_outcome == SM_PAIR_WAITING && millis() - s_awaiting_ack_since_ms >= kAckTimeoutMs)
@@ -812,6 +854,11 @@ const SM_LastPing *espnow_last_ping()
 const SM_FnTxStatus *espnow_last_fn_tx_status()
 {
     return s_have_last_fn_tx_status ? &s_last_fn_tx_status : nullptr;
+}
+
+const SM_FnMainStatus *espnow_last_fn_main_status()
+{
+    return s_have_last_fn_main_status ? &s_last_fn_main_status : nullptr;
 }
 
 const char *espnow_message_type_name(uint8_t messageType)
@@ -840,6 +887,8 @@ const char *espnow_message_type_name(uint8_t messageType)
         return "PROVISION_ACK";
     case SM_STATUS:
         return "STATUS";
+    case SM_FN_MAIN_STATUS:
+        return "FN_MAIN_STATUS";
     case SM_VALUE:
         return "VALUE";
     case SM_SUBSCRIBE:
