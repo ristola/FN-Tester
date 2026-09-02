@@ -162,17 +162,15 @@ namespace
         char addrStr[6];
         format_address_bits(status->lastAddressBits, addrStr, sizeof(addrStr));
 
-        // Press the pod's button to cycle to the next capture (see
-        // M5AtomS3-FN-Bridge/src/main.cpp's fn_main_sim_next_capture()).
         if (status->profileMatch == FN_MAIN_PROFILE_PCB085)
         {
-            lv_label_set_text_fmt(s_state_label, "Simulating \"%s\" - PCB-085 pattern recognized (button = next capture)",
+            lv_label_set_text_fmt(s_state_label, "Simulating \"%s\" - PCB-085 pattern recognized",
                                    status->captureLabel);
             lv_obj_set_style_text_color(s_state_label, lv_palette_main(LV_PALETTE_GREEN), 0);
         }
         else if (status->profileMatch == FN_MAIN_PROFILE_UNRECOGNIZED)
         {
-            lv_label_set_text_fmt(s_state_label, "Simulating \"%s\" - not a recognized PCB-085 pattern (button = next capture)",
+            lv_label_set_text_fmt(s_state_label, "Simulating \"%s\" - not a recognized PCB-085 pattern",
                                    status->captureLabel);
             lv_obj_set_style_text_color(s_state_label, lv_palette_main(LV_PALETTE_ORANGE), 0);
         }

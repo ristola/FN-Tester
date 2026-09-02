@@ -336,7 +336,7 @@ struct SM_FnMainStatusPayload
     uint8_t outputs[16];     // 0/1 per output - only indices with a confirmed address (currently 0-7) are ever set
     uint8_t analogCode;      // 0-15 - only meaningful once address 10110 has been seen this session
     uint8_t lastAddressBits; // most recently decoded 5-bit address, packed MSB-first (bit4=A1..bit0=A5) - for raw diagnostics, per this project's "never hide the raw address" rule
-    char captureLabel[24];   // which embedded capture is currently playing (see the pod's fn_main_sim_captures.h) - button press cycles to the next one
+    char captureLabel[24];   // which capture is currently playing (see the pod's data/sim_captures/) - button press cycles to the next one
 };
 #pragma pack(pop)
 

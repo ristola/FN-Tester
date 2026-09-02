@@ -1,7 +1,7 @@
 #include "fn_bank_profile.h"
 
 #include <Arduino.h>
-#include <SD.h>
+#include <LittleFS.h>
 #include <cstring>
 
 #include "app_state.h"
@@ -90,12 +90,12 @@ namespace
                 *p = ' ';
     }
 
-    bool load_from_sd(const char *path)
+    bool load_from_fs(const char *path)
     {
-        if (!g_sd_ready || !SD.exists(path))
+        if (!g_fs_ready || !LittleFS.exists(path))
             return false;
 
-        File f = SD.open(path, FILE_READ);
+        File f = LittleFS.open(path, FILE_READ);
         if (!f)
             return false;
 
@@ -197,7 +197,7 @@ void fn_bank_profile_remove(int index)
 void fn_bank_profile_load(uint8_t model)
 {
     uint8_t clamped = fn_output_model_clamped(model);
-    if (load_from_sd(kProfilePaths[clamped]))
+    if (load_from_fs(kProfilePaths[clamped]))
         return;
 
     if (clamped == FN_MODEL_PCB085_16)
@@ -208,14 +208,14 @@ void fn_bank_profile_load(uint8_t model)
 
 bool fn_bank_profile_save(uint8_t model)
 {
-    if (!g_sd_ready)
+    if (!g_fs_ready)
         return false;
 
-    if (!SD.exists("/board_profiles"))
-        SD.mkdir("/board_profiles");
+    if (!LittleFS.exists("/board_profiles"))
+        LittleFS.mkdir("/board_profiles");
 
     uint8_t clamped = fn_output_model_clamped(model);
-    File f = SD.open(kProfilePaths[clamped], FILE_WRITE); // overwrite - this is a curated profile, not raw evidence
+    File f = LittleFS.open(kProfilePaths[clamped], FILE_WRITE); // overwrite - this is a curated profile, not raw evidence
     if (!f)
         return false;
 

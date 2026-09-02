@@ -34,6 +34,7 @@
 
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
+#include <LittleFS.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <cstring>
@@ -43,7 +44,6 @@
 
 #include "espnow_protocol.h"
 #include "fn_bus_tx.h"
-#include "fn_main_sim_captures.h"
 #include "fn_pcb085_profile.h"
 #include "fn_reference_frame.h"
 #include "fn_symbol_codec.h"
@@ -181,7 +181,7 @@ namespace
     // dynamic allocation for anything timing-relevant).
     rmt_data_t s_fn_pcb085_buffer[kFnPcb085MaxWords];
 
-    // FN Main "Simulate" mode: replays one of fn_main_sim_captures.h's real
+    // FN Main "Simulate" mode: replays one of data/sim_captures/'s real
     // captures edge-by-edge through fn_word_decoder.h's real-time decoder,
     // so the decode+profile pipeline can be proven and demonstrated with no
     // FN-MAIN receive hardware existing yet (see
@@ -209,6 +209,28 @@ namespace
     // display after the first full cycle completes.
     constexpr uint32_t kSimCaptureDurationMs = 15000;
     FnWordDecoder s_fn_word_decoder;
+
+    // Capture data lives on LittleFS now (data/sim_captures/, flashed via
+    // `pio run -t uploadfs`), not compiled into the firmware image - see
+    // FN_OUTPUT_Tester_Handoff/saleae/analysis/gen_fn_main_sim_captures.py.
+    // manifest.txt (one label per line, line number = capture index) is
+    // read once at boot into s_sim_capture_labels; each capture's own
+    // <index>.bin is read whole into s_sim_edge_buffer only when that
+    // capture starts playing (every known capture comfortably fits - even
+    // the largest, ~17K edges, is under 100KB - so the real-time playback
+    // loop, service_fn_main_sim(), never touches the filesystem itself).
+    constexpr const char *kSimCapturesDir = "/sim_captures";
+    constexpr int kMaxSimCaptures = 16;
+    constexpr size_t kMaxSimEdges = 20000; // headroom above the largest known capture (100 Percent Analog: 17291)
+    struct FnSimEdge
+    {
+        uint16_t durationUs;
+        uint8_t level;
+    };
+    char s_sim_capture_labels[kMaxSimCaptures][24] = {};
+    int s_sim_capture_count = 0; // 0 = no manifest found - SIM_ENABLE becomes a no-op, see on_command()
+    FnSimEdge s_sim_edge_buffer[kMaxSimEdges];
+    size_t s_sim_edge_count = 0;
 
     // Most recently decoded state, mirrored out via SM_FN_MAIN_STATUS
     // whenever a new word is decoded - see broadcast_fn_main_status().
@@ -453,8 +475,11 @@ namespace
             status.outputs[i] = s_fn_main_outputs[i] ? 1 : 0;
         status.analogCode = s_fn_main_analog_code;
         status.lastAddressBits = s_fn_main_last_address_bits;
-        strncpy(status.captureLabel, kFnMainSimCaptures[s_sim_capture_index].label, sizeof(status.captureLabel) - 1);
-        status.captureLabel[sizeof(status.captureLabel) - 1] = '\0';
+        if (s_sim_capture_count > 0)
+        {
+            strncpy(status.captureLabel, s_sim_capture_labels[s_sim_capture_index], sizeof(status.captureLabel) - 1);
+            status.captureLabel[sizeof(status.captureLabel) - 1] = '\0';
+        }
         send_broadcast(SM_FN_MAIN_STATUS, &status, sizeof(status));
     }
 
@@ -468,15 +493,83 @@ namespace
         return s_have_cyd_mac && millis() - s_last_cyd_seen_ms >= kCydLinkLostTimeoutMs;
     }
 
-    // (Re)starts playback from the beginning of kFnMainSimCaptures[index]
-    // (wrapping around) - resets the decoder so stale in-progress word/pair
-    // state from whatever was playing before can't bleed into the new
-    // capture, and clears the last-decoded snapshot so the CYD doesn't keep
-    // showing the previous capture's outputs while this one's first word is
-    // still in flight.
+    // Reads kSimCapturesDir/manifest.txt (one label per line, line number =
+    // capture index) into s_sim_capture_labels - called once at boot.
+    // Leaves s_sim_capture_count at 0 (Simulate becomes a no-op, see
+    // on_command()'s SIM_ENABLE guard) if LittleFS isn't mounted or the
+    // manifest doesn't exist, e.g. data/sim_captures/ was never flashed via
+    // `pio run -t uploadfs`.
+    void load_sim_manifest()
+    {
+        s_sim_capture_count = 0;
+        File f = LittleFS.open(String(kSimCapturesDir) + "/manifest.txt", FILE_READ);
+        if (!f)
+        {
+            Serial.println("FN Main sim: no manifest.txt on LittleFS - Simulate mode unavailable "
+                            "(run gen_fn_main_sim_captures.py + `pio run -t uploadfs`)");
+            return;
+        }
+        while (f.available() && s_sim_capture_count < kMaxSimCaptures)
+        {
+            String line = f.readStringUntil('\n');
+            line.trim();
+            if (line.length() == 0)
+                continue;
+            strncpy(s_sim_capture_labels[s_sim_capture_count], line.c_str(), sizeof(s_sim_capture_labels[0]) - 1);
+            s_sim_capture_labels[s_sim_capture_count][sizeof(s_sim_capture_labels[0]) - 1] = '\0';
+            s_sim_capture_count++;
+        }
+        f.close();
+        Serial.printf("FN Main sim: loaded %d capture label(s) from LittleFS\n", s_sim_capture_count);
+    }
+
+    // Reads kSimCapturesDir/<index>.bin whole into s_sim_edge_buffer - see
+    // s_sim_edge_buffer's comment for why this is a one-shot load rather
+    // than per-edge file reads. 3-byte records (uint16 durationUs
+    // little-endian + uint8 level), matching gen_fn_main_sim_captures.py's
+    // output format exactly - deliberately not a raw struct read, so this
+    // doesn't depend on compiler struct packing.
+    bool load_sim_capture(size_t index)
+    {
+        s_sim_edge_count = 0;
+        char path[40];
+        snprintf(path, sizeof(path), "%s/%u.bin", kSimCapturesDir, static_cast<unsigned>(index));
+        File f = LittleFS.open(path, FILE_READ);
+        if (!f)
+        {
+            Serial.printf("FN Main sim: failed to open %s\n", path);
+            return false;
+        }
+        uint8_t rec[3];
+        while (s_sim_edge_count < kMaxSimEdges && f.read(rec, sizeof(rec)) == sizeof(rec))
+        {
+            s_sim_edge_buffer[s_sim_edge_count].durationUs = static_cast<uint16_t>(rec[0] | (rec[1] << 8));
+            s_sim_edge_buffer[s_sim_edge_count].level = rec[2];
+            s_sim_edge_count++;
+        }
+        f.close();
+        if (s_sim_edge_count == 0)
+            Serial.printf("FN Main sim: %s read 0 edges\n", path);
+        return s_sim_edge_count > 0;
+    }
+
+    // (Re)starts playback from the beginning of capture `index` (wrapping
+    // around) - resets the decoder so stale in-progress word/pair state
+    // from whatever was playing before can't bleed into the new capture,
+    // and clears the last-decoded snapshot so the CYD doesn't keep showing
+    // the previous capture's outputs while this one's first word is still
+    // in flight.
     void fn_main_sim_start_capture(size_t index)
     {
-        s_sim_capture_index = index % kFnMainSimCaptureCount;
+        if (s_sim_capture_count == 0)
+        {
+            Serial.println("FN Main sim: no captures loaded - can't start");
+            return;
+        }
+        s_sim_capture_index = index % static_cast<size_t>(s_sim_capture_count);
+        if (!load_sim_capture(s_sim_capture_index))
+            return; // load_sim_capture() already logged why
+
         s_sim_edge_index = 0;
         s_sim_next_edge_due_us = micros();
         s_sim_capture_started_ms = millis();
@@ -488,8 +581,8 @@ namespace
         s_fn_main_analog_code = 0;
         s_fn_main_last_address_bits = 0;
 
-        Serial.printf("FN Main sim: now playing \"%s\" (%u/%u)\n", kFnMainSimCaptures[s_sim_capture_index].label,
-                      static_cast<unsigned>(s_sim_capture_index + 1), static_cast<unsigned>(kFnMainSimCaptureCount));
+        Serial.printf("FN Main sim: now playing \"%s\" (%u/%u)\n", s_sim_capture_labels[s_sim_capture_index],
+                      static_cast<unsigned>(s_sim_capture_index + 1), static_cast<unsigned>(s_sim_capture_count));
         broadcast_fn_main_status();
     }
 
@@ -532,8 +625,7 @@ namespace
         if (static_cast<int32_t>(micros() - s_sim_next_edge_due_us) < 0)
             return;
 
-        const FnSimCapture &capture = kFnMainSimCaptures[s_sim_capture_index];
-        const FnSimEdge &edge = capture.edges[s_sim_edge_index];
+        const FnSimEdge &edge = s_sim_edge_buffer[s_sim_edge_index];
 
         FnDecodedWord word;
         if (s_fn_word_decoder.feed(edge.durationUs, &word))
@@ -549,7 +641,7 @@ namespace
 
         s_sim_next_edge_due_us += edge.durationUs;
         s_sim_edge_index++;
-        if (s_sim_edge_index >= capture.length)
+        if (s_sim_edge_index >= s_sim_edge_count)
             s_sim_edge_index = 0;
     }
 
@@ -974,9 +1066,16 @@ namespace
         }
         else if (strcmp(cmd.commandName, "SIM_ENABLE") == 0)
         {
-            s_sim_enabled = true;
-            fn_main_sim_start_capture(0); // auto-starts the first capture immediately
-            Serial.println("FN Main simulation ENABLED - button now cycles captures instead of pinging");
+            if (s_sim_capture_count == 0)
+            {
+                Serial.println("FN Main simulation NOT enabled - no captures loaded from LittleFS");
+            }
+            else
+            {
+                s_sim_enabled = true;
+                fn_main_sim_start_capture(0); // auto-starts the first capture immediately
+                Serial.println("FN Main simulation ENABLED - button now cycles captures instead of pinging");
+            }
         }
         else if (strcmp(cmd.commandName, "SIM_DISABLE") == 0)
         {
@@ -1268,6 +1367,15 @@ void setup()
 {
     Serial.begin(115200);
 
+    // formatOnFail=true so a first-ever boot (before data/sim_captures/ has
+    // ever been flashed via `pio run -t uploadfs`) self-heals into an
+    // empty, mountable filesystem rather than getting permanently stuck -
+    // load_sim_manifest() below already handles an empty/missing manifest
+    // gracefully (Simulate mode just stays unavailable).
+    if (!LittleFS.begin(/*formatOnFail=*/true))
+        Serial.println("LittleFS mount failed - Simulate mode unavailable");
+    load_sim_manifest();
+
     pinMode(kButtonPin, INPUT_PULLUP);
 
     s_led.begin();
@@ -1335,8 +1443,11 @@ void loop()
             uart_test_start();
         else if (cmd == "simenable")
         {
-            s_sim_enabled = true;
-            fn_main_sim_start_capture(0);
+            if (s_sim_capture_count > 0)
+            {
+                s_sim_enabled = true;
+                fn_main_sim_start_capture(0);
+            }
         }
         else if (cmd == "simdisable")
         {

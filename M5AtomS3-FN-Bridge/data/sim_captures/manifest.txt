@@ -1,0 +1,5 @@
+No Outputs
+Alarm Output 1
+PB & HTR Output 4&8
+Blind Validation
+100 Percent Analog

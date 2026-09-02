@@ -1,5 +1,6 @@
 #include "app_state.h"
 
+#include <LittleFS.h>
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -8,6 +9,7 @@
 
 AppConfig g_config;
 bool g_sd_ready = false;
+bool g_fs_ready = false;
 
 void app_wifi_apply()
 {
@@ -77,4 +79,13 @@ bool app_sd_init()
     g_sd_ready = false;
 #endif
     return g_sd_ready;
+}
+
+bool app_fs_init()
+{
+    // formatOnFail=true so a first-ever boot (or a corrupted filesystem)
+    // self-heals into an empty, mountable filesystem rather than getting
+    // permanently stuck failing LittleFS.open() calls.
+    g_fs_ready = LittleFS.begin(/*formatOnFail=*/true);
+    return g_fs_ready;
 }

@@ -1,7 +1,7 @@
 #include "ui_capture_learn.h"
 
 #include <Arduino.h>
-#include <SD.h>
+#include <LittleFS.h>
 #include <cstdarg>
 
 #include "app_state.h"
@@ -376,16 +376,16 @@ namespace
     }
 
     // Writes the current session log to /capture_learn/session_NNN.csv on
-    // the SD card (first unused NNN - never overwrites an earlier session,
+    // the internal filesystem (first unused NNN - never overwrites an earlier session,
     // matching this project's "never overwrite raw evidence" rule). Each
     // row is elapsed session time + the logged event; the header carries
     // the board model and the operator-entered Saleae capture filename so
     // the CSV stays correlated with that external evidence.
-    void save_session_to_sd()
+    void save_session_to_fs()
     {
-        if (!g_sd_ready)
+        if (!g_fs_ready)
         {
-            lv_label_set_text(s_log_save_status_lbl, "SD card not ready - can't save");
+            lv_label_set_text(s_log_save_status_lbl, "Internal filesystem not ready - can't save");
             lv_obj_set_style_text_color(s_log_save_status_lbl, lv_palette_main(LV_PALETTE_ORANGE), 0);
             return;
         }
@@ -396,20 +396,20 @@ namespace
             return;
         }
 
-        if (!SD.exists("/capture_learn"))
-            SD.mkdir("/capture_learn");
+        if (!LittleFS.exists("/capture_learn"))
+            LittleFS.mkdir("/capture_learn");
 
         char path[64];
         int n = 1;
         do
         {
             snprintf(path, sizeof(path), "/capture_learn/session_%03d.csv", n++);
-        } while (SD.exists(path) && n < 1000);
+        } while (LittleFS.exists(path) && n < 1000);
 
-        File f = SD.open(path, FILE_WRITE);
+        File f = LittleFS.open(path, FILE_WRITE);
         if (!f)
         {
-            lv_label_set_text(s_log_save_status_lbl, "Failed to open file on SD card");
+            lv_label_set_text(s_log_save_status_lbl, "Failed to open file on internal filesystem");
             lv_obj_set_style_text_color(s_log_save_status_lbl, lv_palette_main(LV_PALETTE_RED), 0);
             return;
         }
@@ -430,7 +430,7 @@ namespace
 
     void on_save_log_clicked(lv_event_t *)
     {
-        save_session_to_sd();
+        save_session_to_fs();
     }
 
     // ---- Address Banks (list) handlers ----
@@ -464,12 +464,12 @@ namespace
     {
         if (fn_bank_profile_save(current_model()))
         {
-            lv_label_set_text(s_banks_status_lbl, "Profile saved to SD");
+            lv_label_set_text(s_banks_status_lbl, "Profile saved");
             lv_obj_set_style_text_color(s_banks_status_lbl, lv_palette_main(LV_PALETTE_GREEN), 0);
         }
         else
         {
-            lv_label_set_text(s_banks_status_lbl, "SD card not ready - can't save");
+            lv_label_set_text(s_banks_status_lbl, "Internal filesystem not ready - can't save");
             lv_obj_set_style_text_color(s_banks_status_lbl, lv_palette_main(LV_PALETTE_ORANGE), 0);
         }
     }

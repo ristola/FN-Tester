@@ -194,6 +194,7 @@ void setup()
     ui_home_start();
 
     app_sd_init();
+    app_fs_init();
     app_wifi_apply();
     // Requires Wi-Fi already in STA mode (which app_wifi_apply() just set,
     // regardless of whether the actual join succeeds) - doesn't need an
