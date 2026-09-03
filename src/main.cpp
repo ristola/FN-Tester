@@ -237,6 +237,7 @@ void loop()
 {
     esp_task_wdt_reset();
     ArduinoOTA.handle();
+    app_wifi_service();
 
     uint32_t const now = millis();
     lv_tick_inc(now - s_last_tick);

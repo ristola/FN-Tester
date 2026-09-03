@@ -566,10 +566,14 @@ void ui_espnow_show()
     lv_label_set_text_fmt(s_device_id_label, "Device ID: 0x%08X", espnow_local_device_id());
     lv_label_set_text_fmt(s_mac_label, "MAC Address: %s", WiFi.macAddress().c_str());
 
+    // ESP-NOW works on a fixed channel whether or not Wi-Fi is connected -
+    // see app_wifi_service()'s fallback-channel logic - so this always
+    // shows a real channel number now, just flagged when it's the no-AP
+    // fallback rather than a real Wi-Fi association.
     if (WiFi.status() == WL_CONNECTED)
         lv_label_set_text_fmt(s_channel_label, "Channel: %d", WiFi.channel());
     else
-        lv_label_set_text(s_channel_label, "Channel: - (connect to Wi-Fi first)");
+        lv_label_set_text_fmt(s_channel_label, "Channel: %d (no Wi-Fi - fallback)", WiFi.channel());
 
     refresh_last_ping();
 

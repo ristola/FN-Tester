@@ -4,12 +4,50 @@
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 
+#include "espnow_protocol.h"
 #include "espnow_state.h"
 
 AppConfig g_config;
 bool g_sd_ready = false;
 bool g_fs_ready = false;
+bool g_wifi_fallback_active = false;
+
+namespace
+{
+    // How long to give a configured network to actually associate before
+    // giving up and pinning a fixed channel instead. Real hardware testing
+    // found that without this, an unreachable saved AP leaves Arduino-ESP32
+    // auto-reconnecting (and actively channel-scanning) indefinitely in the
+    // background - which starves ESP-NOW pairing, since the pod's
+    // channel-sweep pairing protocol (M5AtomS3-FN-Bridge/src/main.cpp)
+    // needs the CYD parked on one stable channel to be found at all. Roughly
+    // matches ui_wifi_setup.cpp's own ~10s interactive connect timeout, with
+    // a little slack since this runs unattended at boot.
+    constexpr uint32_t kWifiConnectTimeoutMs = 12000;
+
+    // Channel ESP-NOW falls back to when there's no Wi-Fi association.
+    // Deliberately SM_PROVISIONING_CHANNEL_MIN (espnow_protocol.h) - that's
+    // also the first channel the pod's own sweep dwells on, so a pod
+    // pairing right after boot with no Wi-Fi in range finds the CYD on the
+    // very first hop instead of needing to sweep further.
+    constexpr uint8_t kEspNowFallbackChannel = SM_PROVISIONING_CHANNEL_MIN;
+
+    uint32_t s_wifi_apply_ms = 0;
+    bool s_wifi_settled = false; // true once this attempt has connected or fallen back - stops app_wifi_service() from re-checking every tick
+
+    void enter_fallback_channel()
+    {
+        // Stop the (otherwise indefinite) background connect/scan so it
+        // can't keep hopping the radio off the fallback channel.
+        WiFi.setAutoReconnect(false);
+        WiFi.disconnect(false);
+        esp_wifi_set_channel(kEspNowFallbackChannel, WIFI_SECOND_CHAN_NONE);
+        g_wifi_fallback_active = true;
+        Serial.printf("Wi-Fi: no AP association - ESP-NOW falling back to fixed channel %u\n", kEspNowFallbackChannel);
+    }
+}
 
 void app_wifi_apply()
 {
@@ -41,9 +79,37 @@ void app_wifi_apply()
     // rather than reconnecting anyway just because credentials exist. The
     // radio is still in STA mode above regardless, so ESP-NOW keeps working.
     if (!g_config.wifi_enabled || !g_config.isWifiConfigured())
+    {
+        // Nothing is ever going to associate - no point waiting out
+        // kWifiConnectTimeoutMs, pin the fallback channel immediately.
+        s_wifi_settled = true;
+        enter_fallback_channel();
+        return;
+    }
+
+    s_wifi_settled = false;
+    g_wifi_fallback_active = false;
+    s_wifi_apply_ms = millis();
+    WiFi.begin(g_config.wifi_ssid.c_str(), g_config.wifi_password.c_str());
+}
+
+void app_wifi_service()
+{
+    if (s_wifi_settled)
         return;
 
-    WiFi.begin(g_config.wifi_ssid.c_str(), g_config.wifi_password.c_str());
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        s_wifi_settled = true;
+        g_wifi_fallback_active = false;
+        return;
+    }
+
+    if (millis() - s_wifi_apply_ms >= kWifiConnectTimeoutMs)
+    {
+        s_wifi_settled = true;
+        enter_fallback_channel();
+    }
 }
 
 void app_wifi_disable()
@@ -58,6 +124,8 @@ void app_wifi_disable()
     // ESP-NOW needs and nothing more).
     WiFi.mode(WIFI_STA);
     espnow_reestablish_after_wifi_change();
+    s_wifi_settled = true;
+    enter_fallback_channel();
 
     g_config.wifi_enabled = false;
     config_save(g_config);

@@ -18,6 +18,23 @@ void app_wifi_apply();
 // wifi_enabled back to true) to turn it back on.
 void app_wifi_disable();
 
+// Poll from loop() (cheap - just a millis() comparison most ticks). If
+// Wi-Fi is enabled+configured but hasn't associated within a boot/reconnect
+// grace period, stops the (otherwise indefinite, channel-hopping) connect
+// attempt and pins the radio to a fixed fallback channel instead - see
+// g_wifi_fallback_active's comment for why. No-op once Wi-Fi has connected
+// or fallback has already been entered for the current app_wifi_apply()
+// attempt.
+void app_wifi_service();
+
+// True when ESP-NOW is running on a fixed fallback channel because there's
+// no Wi-Fi association (not configured, disabled, or configured but out of
+// range/unreachable) - see app_wifi_service()/app_wifi_apply(). Pairing and
+// all other ESP-NOW traffic work normally in this state; only things that
+// need an actual AP (OTA, NTP, etc.) don't. False once/if a real AP
+// association succeeds.
+extern bool g_wifi_fallback_active;
+
 // True once the microSD card has been successfully mounted.
 extern bool g_sd_ready;
 
